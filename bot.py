@@ -29,9 +29,12 @@ SCREENSHOT_PATH = "snl-league-table.png"
 UK_TZ = ZoneInfo("Europe/London")
 
 # Weekly post window (UK local time)
-POST_DAY = 0          # Monday (Mon=0 … Sun=6)
-POST_HOUR = 18        # 18:00 UK time
-POST_MINUTE_MAX = 10  # Allow 18:00–18:10 for scheduler jitter
+now_test = datetime.now(UK_TZ)
+
+POST_DAY = now_test.weekday()
+POST_HOUR = now_test.hour
+POST_MINUTE_MAX = now_test.minute + 10
+
 
 # CSS selector for the league table container
 TABLE_SELECTOR = ".sp-template-league-table"
