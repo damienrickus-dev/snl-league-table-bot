@@ -1,55 +1,45 @@
 import json
 import os
-import re
 import logging
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
-# ----------------------------
+# -------------------------------------------------
 # Logging
-# ----------------------------
+# -------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ----------------------------
-# Env
-# ----------------------------
+# -------------------------------------------------
+# Environment
+# -------------------------------------------------
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 if not WEBHOOK_URL:
     raise EnvironmentError("DISCORD_WEBHOOK_URL not set")
 
-# ----------------------------
+# -------------------------------------------------
 # Constants
-# ----------------------------
-UK_TZ = ZoneInfo("Europe/London")
-STATE_FILE = "posted.json"
-
-# SIHA official league table page (SNL 25-26)
+# -------------------------------------------------
 LEAGUE_TABLE_URL = "https://siha-uk.co.uk/snl-league-table-25-26/"
+STATE_FILE = "posted.json"
+SCREENSHOT_PATH = "snl-league-table.png"
 
-# Post window (UK local time) – allows scheduler jitter
-now_test = datetime.now(UK_TZ)
+UK_TZ = ZoneInfo("Europe/London")
 
-POST_DAY = now_test.weekday()
-POST_HOUR = now_test.hour
-POST_MINUTE_MAX = now_test.minute + 5
+# Weekly post window (UK local time)
+POST_DAY = 0          # Monday (Mon=0 … Sun=6)
+POST_HOUR = 18        # 18:00 UK time
+POST_MINUTE_MAX = 10  # Allow 18:00–18:10 for scheduler jitter
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
+# CSS selector for the league table container
+TABLE_SELECTOR = ".sp-template-league-table"
 
-
-def post_to_discord(content: str) -> None:
-    r = requests.post(WEBHOOK_URL, json={"content": content}, timeout=20)
-    r.raise_for_status()
-
-
-def load_state() -> Dict:
+# -------------------------------------------------
+# State helpers
+# -------------------------------------------------
+def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
         return {"last_posted_week": ""}
     try:
@@ -62,156 +52,98 @@ def load_state() -> Dict:
     return state
 
 
-def save_state(state: Dict) -> None:
+def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
 
-def current_iso_week_key(now: datetime) -> str:
-    # Example: "2025-W51"
-    iso_year, iso_week, _ = now.isocalendar()
-    return f"{iso_year}-W{iso_week:02d}"
+def iso_week_key(now: datetime) -> str:
+    year, week, _ = now.isocalendar()
+    return f"{year}-W{week:02d}"
 
 
-# ----------------------------
-# Scrape + format league table
-# ----------------------------
-def scrape_snl_table() -> Tuple[List[Dict], Optional[Dict]]:
-    """
-    Returns:
-      rows: list of dicts like {"pos":1,"team":"Warriors","gp":19,"pts":28,...}
-      caps_row: the row for Capitals (team contains 'Caps' or 'Capitals'), if found
-    """
-    html = requests.get(LEAGUE_TABLE_URL, timeout=20).text
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Find the first HTML table on the page (SIHA page contains a standings table)
-    table = soup.find("table")
-    if not table:
-        return [], None
-
-    # Extract header labels (best effort)
-    headers = []
-    thead = table.find("thead")
-    if thead:
-        headers = [norm(th.get_text(" ")) for th in thead.find_all(["th", "td"])]
-
-    # Extract body rows
-    rows = []
-    tbody = table.find("tbody") or table
-    for tr in tbody.find_all("tr"):
-        cells = [norm(td.get_text(" ")) for td in tr.find_all(["td", "th"])]
-        if len(cells) < 3:
-            continue
-
-        # If headers exist, map them; otherwise assume common order:
-        # Pos, Team, GP, W, L, OTL, GF, GA, Diff, PTS, Strk (varies)
-        row = {}
-
-        def to_int(x: str) -> Optional[int]:
-            x = x.replace("+", "").strip()
-            if re.fullmatch(r"-?\d+", x):
-                return int(x)
-            return None
-
-        # Best effort parsing by position
-        pos = to_int(cells[0])
-        team = cells[1] if len(cells) > 1 else ""
-        gp = to_int(cells[2]) if len(cells) > 2 else None
-
-        # Points often near the end; try to detect last int as PTS
-        ints = [to_int(c) for c in cells]
-        ints_clean = [i for i in ints if i is not None]
-        pts = ints_clean[-2] if len(ints_clean) >= 2 else (ints_clean[-1] if ints_clean else None)
-
-        row["pos"] = pos
-        row["team"] = team
-        row["gp"] = gp
-        row["pts"] = pts
-        row["raw"] = cells  # keep raw for resilience
-
-        # keep only rows with a team name + pos
-        if row["team"] and row["pos"] is not None:
-            rows.append(row)
-
-    # Sort by position if available
-    rows.sort(key=lambda r: (r["pos"] if r["pos"] is not None else 999))
-
-    caps_row = None
-    for r in rows:
-        t = (r.get("team") or "").lower()
-        if "cap" in t:  # covers "Caps" / "Capitals"
-            caps_row = r
-            break
-
-    return rows, caps_row
-
-
-def format_weekly_post(rows: List[Dict], caps_row: Optional[Dict], week_key: str) -> str:
-    now = datetime.now(UK_TZ)
-    title = f"🏒 **SNL League Table — {week_key}**\n_As of {now:%a %d %b %Y, %H:%M} (UK time)_\n"
-
-    if not rows:
-        return title + "\nNo table data detected this week."
-
-    # Highlight Capitals
-    if caps_row:
-        title += f"\n🟢 **Edinburgh Capitals:** Position **{caps_row.get('pos')}** — **{caps_row.get('pts')} pts** (GP {caps_row.get('gp')})\n"
-    else:
-        title += "\n🟡 **Edinburgh Capitals:** Not detected in the table this week.\n"
-
-    # Print top 10 (or all if fewer)
-    lines = []
-    for r in rows[:10]:
-        pos = r.get("pos")
-        team = r.get("team")
-        pts = r.get("pts")
-        gp = r.get("gp")
-        marker = "✅" if caps_row and r.get("team") == caps_row.get("team") else "•"
-        lines.append(f"{marker} {pos}. {team} — {pts} pts (GP {gp})")
-
-    return title + "\n" + "\n".join(lines)
-
-
-# ----------------------------
-# Posting control (weekly)
-# ----------------------------
 def should_post_now(now: datetime) -> bool:
-    # Only during Monday 18:00–18:10 UK time
-    if now.weekday() != POST_DAY:
-        return False
-    if now.hour != POST_HOUR:
-        return False
-    if not (0 <= now.minute <= POST_MINUTE_MAX):
-        return False
-    return True
+    return (
+        now.weekday() == POST_DAY
+        and now.hour == POST_HOUR
+        and 0 <= now.minute <= POST_MINUTE_MAX
+    )
 
+# -------------------------------------------------
+# Screenshot logic (ELEMENT ONLY)
+# -------------------------------------------------
+def take_table_screenshot(url: str, selector: str, path: str) -> None:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 1400, "height": 900})
 
+        page.goto(url, wait_until="networkidle", timeout=60000)
+
+        # Wait for the league table container to exist
+        table = page.wait_for_selector(selector, timeout=30000)
+
+        # Ensure it’s fully in view
+        table.scroll_into_view_if_needed()
+        page.wait_for_timeout(500)
+
+        # Screenshot ONLY the table element
+        table.screenshot(path=path)
+
+        browser.close()
+
+# -------------------------------------------------
+# Discord posting
+# -------------------------------------------------
+def post_image_to_discord(image_path: str, content: str) -> None:
+    with open(image_path, "rb") as f:
+        files = {
+            "file": (os.path.basename(image_path), f, "image/png")
+        }
+        data = {
+            "content": content
+        }
+        r = requests.post(WEBHOOK_URL, data=data, files=files, timeout=60)
+        r.raise_for_status()
+
+# -------------------------------------------------
+# Main
+# -------------------------------------------------
 def main() -> None:
     now = datetime.now(UK_TZ)
+
     if not should_post_now(now):
-        logging.info("Not within weekly post window.")
+        logging.info("Not in weekly posting window.")
         return
 
-    week_key = current_iso_week_key(now)
     state = load_state()
+    week_key = iso_week_key(now)
 
-    if state.get("last_posted_week") == week_key:
-        logging.info("Already posted this week.")
+    if state["last_posted_week"] == week_key:
+        logging.info("League table already posted this week.")
         return
 
-    try:
-        rows, caps_row = scrape_snl_table()
-        msg = format_weekly_post(rows, caps_row, week_key)
-        post_to_discord(msg)
-    except Exception as e:
-        logging.error(f"Weekly table bot failed: {e}")
-        raise
+    logging.info("Taking screenshot of SNL league table element...")
+    take_table_screenshot(
+        LEAGUE_TABLE_URL,
+        TABLE_SELECTOR,
+        SCREENSHOT_PATH
+    )
+
+    caption = (
+        f"🏒 **SNL League Table** — {week_key}\n"
+        f"_Source: SIHA_"
+    )
+
+    logging.info("Posting league table image to Discord...")
+    post_image_to_discord(SCREENSHOT_PATH, caption)
 
     state["last_posted_week"] = week_key
     save_state(state)
-    logging.info("Posted weekly league table successfully.")
 
+    logging.info("Weekly league table posted successfully.")
 
+# -------------------------------------------------
+# Entrypoint
+# -------------------------------------------------
 if __name__ == "__main__":
     main()
