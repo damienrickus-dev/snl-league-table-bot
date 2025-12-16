@@ -31,9 +31,11 @@ STATE_FILE = "posted.json"
 LEAGUE_TABLE_URL = "https://siha-uk.co.uk/snl-league-table-25-26/"
 
 # Post window (UK local time) – allows scheduler jitter
-POST_DAY = 0  # Monday (Mon=0 ... Sun=6)
-POST_HOUR = 18
-POST_MINUTE_MAX = 10  # 18:00–18:10
+now_test = datetime.now(UK_TZ)
+
+POST_DAY = now_test.weekday()
+POST_HOUR = now_test.hour
+POST_MINUTE_MAX = now_test.minute + 5
 
 # ----------------------------
 # Helpers
